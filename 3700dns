@@ -1,0 +1,204 @@
+#!/usr/bin/python -u
+#
+# CS3700, Northeastern University
+# Zach Ferland
+
+import sys
+import socket
+import time
+import datetime
+import struct
+from string import ascii_letters, digits, punctuation
+
+# Explicit imports
+from util import dump_packet
+from util import parseArguments
+from util import parse
+
+# Parses each supported resource record
+
+def parseA(data, a_rdata, offset):
+  ip_tuple = struct.unpack('!4B', a_rdata)
+  ip = '.'.join(str(x) for x in ip_tuple)
+  return 'IP\t' + ip + '\t' + aa
+
+def parseCNAME(data, a_rdata, offset):
+  alias, o, x = parse(data, offset, offset)
+  return 'CNAME\t' + alias + '\t' + aa
+
+def parseNS(data, a_rdata, offset):
+  ns, o, x = parse(data, offset, offset)
+  return 'NS\t' + ns + '\t' + aa
+
+def parseMX(data, a_rdata, offset):
+  preference = data[offset: offset + 2]
+  preference = struct.unpack('!h', preference)[0]
+  exchange, o, x = parse(data, offset + 2, offset + 2 )
+  return 'MX\t' + exchange + '\t' + str(preference) + '\t' + aa
+
+# Can easily throw error if not supported
+parseResource = {'a': parseA, 'cname': parseCNAME, 'ns': parseNS, 'mx': parseMX}
+
+
+# MAIN ###################################################
+
+# Get arguments
+ip, port, query, qtype_str = parseArguments(sys.argv)
+dest = (ip, port)
+
+# Socket params
+TIMEOUT = 5
+MSG_SIZE = 1500
+
+# Support query types, a, ns, and mx records
+qtypes = {'a': 0x0001, 'ns': 0x0002, 'mx': 0x000f}
+rtype = {0x0001: 'a', 0x0002: 'ns', 0x000f: 'mx', 0x0005: 'cname'}
+
+# DNS packet properties
+size = {'type': 2, 'class': 2, 'ttl': 4, 'rdlength': 2}
+offsetd = {'type': 0, 'class': 2, 'ttl': 4, 'rdlength': 8}
+head_attr = ('type', 'class', 'ttl', 'rdlength')
+ 
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(TIMEOUT)
+
+
+# PREPARE REQUEST AND SEND ###################################
+
+# Header (total 12 bytes)
+# Reference https://tools.ietf.org/html/rfc2929#section-2
+# For complete information on DNS headers and their formation
+
+id = 1337   #16 bits
+qr = 0   #1 bit
+opcode = 0 #4 bits
+aa = 0 #1 bit
+tc = 0 #1 bit
+rd = 1 #1 bit
+ra = 0 #1 bit 
+z = 0 # 3 bits
+rcode = 0 #4 bits
+qdcount = 1 #16 bits
+ancount = 0 #16 bits
+nscount = 0 #16 bits
+arcount = 0 #16 bits
+
+# Third Byte
+r = 0
+r = (qr << 7) | r
+r = (opcode << 3) | r
+r = (aa << 2) | r
+r = (tc << 1) | r
+r = (rd << 0) | r
+
+# Fourth byte
+s = 0
+s = (ra << 7) | s
+s = (z << 4) | s
+s = (rcode << 0) | s
+
+# Put together header bytes
+header = struct.pack('!h', id)  
+header += struct.pack('!h', r)[1]
+header += struct.pack('!h', s)[1]
+header += struct.pack('!hhhh', qdcount, ancount, nscount, arcount)
+
+#DNS Question Body
+labels = query.split('.')
+qclass = 0x0001
+qname = ''
+qclass = 0x0001
+
+for label in labels:
+  length = len(label)
+  qname += struct.pack('!h', length)[1] + label
+
+# Add null byte
+qname =  qname + struct.pack('!h', 0)[1]
+
+# Put together body
+body =  qname + struct.pack('! hh', qtypes[qtype_str], qclass)
+
+# Build complete Packet
+packet = header + body
+
+# Dump Packet
+dump_packet(packet)
+
+# Send the packet to the DNS server
+sock.sendto(packet, dest)
+
+# RESPONSE, PARSE, THEN OUTPUT ###############################
+
+# Now wait for response 
+try:
+    result = sock.recvfrom(MSG_SIZE)
+except socket.timeout:
+    print 'NORESPONSE'
+    sys.exit(-1)
+
+# If nothing, timeout, otherwise parse response
+if result:
+  (data, addr) = result
+
+  # Header always a fixed 12 bytes
+  header = data[:12]
+  body = data[12:]
+
+  # Needed Header Info
+  ancount, nscount, arcount = struct.unpack('!hhh', header[6:12]) 
+
+  # authoritive huh
+  zero_byte = struct.pack('!h', 0)[1]
+  aabit = struct.unpack('!h',  zero_byte + header[2])[0]
+  aa = ''
+
+  # Reads 6th bit
+  if (aabit >> 2 & 1) == 0:
+    aa = 'nonauth'
+  else:
+    aa = 'auth'
+
+  rcode = struct.unpack('!h',  zero_byte + header[3])[0]
+  mask = 15 # '00001111'
+  rcode = rcode & mask
+
+  # Nothing was found, report so
+  if rcode == 3:
+    print 'NOTFOUND'
+
+  # QUESTION SECTION (not needed for this project)
+  name, offset, max_offset = parse(data, 12, 12)
+  a_type = data[offsetd['type']: offsetd['type'] + size['type']]
+  a_class = data[offsetd['class']: offsetd['class'] + size['class']]
+  offset += size['type'] + size['class']
+
+  # Only goes through answer section in this project
+  for i in xrange(ancount):
+    name, o, offset = parse(data, offset, offset)
+
+    # Calculate offsets and sizes for values
+    start = {k: (v + offset) for k, v in offsetd.items()}
+    end = {k: (start[k] + v) for k, v in size.items()}
+    position = lambda str: data[start[str]: end[str]]
+
+    # Get values
+    a_type, a_class, a_ttl, a_rdlength = [position(val) for val in head_attr]
+
+    # Unpack Values
+    a_rdlength = struct.unpack('!H', a_rdlength)[0]
+    a_type = struct.unpack('!H', a_type)[0]
+
+    # Update offset now (size is size of each attr)
+    offset = offset + sum(size.values())
+    a_rdata = data[offset: offset + a_rdlength]
+
+    print parseResource[rtype[a_type]](data, a_rdata, offset)
+
+    # Update offset for next resource
+    offset = offset + a_rdlength
+
+else:
+  log("[error] timeout")
+  sys.exit(-1)
